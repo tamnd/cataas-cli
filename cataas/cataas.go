@@ -1,38 +1,82 @@
 // Package cataas is the library behind the cataas command line:
-// the HTTP client, request shaping, and the typed data models for cataas.
+// the HTTP client, request shaping, and the typed data models for cataas.com.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
 // transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
 package cataas
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to cataas. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "cataas/dev (+https://github.com/tamnd/cataas-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at cataas.com; change it once you
-// know the real endpoints you want to read.
+// Host is the site this client talks to.
 const Host = "cataas.com"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to cataas over HTTP.
+// DefaultUserAgent identifies the client to cataas honestly.
+const DefaultUserAgent = "cataas-cli/0.1 (tamnd87@gmail.com)"
+
+// Cat is a single cat record from the CATAAS API.
+type Cat struct {
+	ID   string   `json:"id"   kit:"id"`
+	URL  string   `json:"url"`
+	Tags []string `json:"tags"`
+}
+
+// Tag is a tag record from the CATAAS API.
+type Tag struct {
+	Name string `json:"name" kit:"id"`
+}
+
+// apiCat is the raw wire shape from the API before we remap _id → id.
+type apiCat struct {
+	RawID string   `json:"_id"`
+	URL   string   `json:"url"`
+	Tags  []string `json:"tags"`
+}
+
+func (a apiCat) toCat() *Cat {
+	return &Cat{
+		ID:   a.RawID,
+		URL:  a.URL,
+		Tags: a.Tags,
+	}
+}
+
+// Config holds the client settings.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
+}
+
+// DefaultConfig returns sensible defaults for the client.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
+		Rate:      300 * time.Millisecond,
+		Timeout:   15 * time.Second,
+		Retries:   3,
+		UserAgent: DefaultUserAgent,
+	}
+}
+
+// Client talks to cataas.com over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,21 +84,21 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
+		UserAgent: cfg.UserAgent,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
 // Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// to the client's settings.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +108,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,12 +117,12 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -123,78 +167,78 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on cataas.com. It is a stand-in for the typed records you
-// will model from the real cataas endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `cataas cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// RandomCat returns a random cat, optionally filtered by tag.
+// If tag is non-empty, uses GET /cat/<tag>?json=true, otherwise GET /cat?json=true.
+func (c *Client) RandomCat(ctx context.Context, tag string) (*Cat, error) {
+	var endpoint string
+	if tag != "" {
+		endpoint = c.BaseURL + "/cat/" + url.PathEscape(tag) + "?json=true"
+	} else {
+		endpoint = c.BaseURL + "/cat?json=true"
+	}
+	body, err := c.Get(ctx, endpoint)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+	var raw apiCat
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("parse cat: %w", err)
+	}
+	cat := raw.toCat()
+	if cat.ID == "" {
+		return nil, fmt.Errorf("random cat returned empty id")
+	}
+	return cat, nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
+// ListCats returns a list of cats, optionally filtered by tag, up to limit.
+func (c *Client) ListCats(ctx context.Context, tag string, limit int) ([]*Cat, error) {
+	q := url.Values{}
+	if limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", limit))
+	}
+	if tag != "" {
+		q.Set("tags", tag)
+	}
+	endpoint := c.BaseURL + "/api/cats?" + q.Encode()
+	body, err := c.Get(ctx, endpoint)
 	if err != nil {
 		return nil, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
+	var raws []apiCat
+	if err := json.Unmarshal(body, &raws); err != nil {
+		return nil, fmt.Errorf("parse cats: %w", err)
+	}
+	var out []*Cat
+	for _, raw := range raws {
+		if raw.RawID == "" {
 			continue
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
+		out = append(out, raw.toCat())
+	}
+	return out, nil
+}
+
+// ListTags returns all available tags, filtering out tags shorter than 2 characters.
+// If limit > 0, returns at most limit tags.
+func (c *Client) ListTags(ctx context.Context, limit int) ([]*Tag, error) {
+	body, err := c.Get(ctx, c.BaseURL+"/api/tags")
+	if err != nil {
+		return nil, err
+	}
+	var raw []string
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("parse tags: %w", err)
+	}
+	var out []*Tag
+	for _, t := range raw {
+		if len(t) < 2 {
+			continue
+		}
+		out = append(out, &Tag{Name: t})
 		if limit > 0 && len(out) >= limit {
 			break
 		}
 	}
 	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
